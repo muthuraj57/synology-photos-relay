@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NAS Photo Upload</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 16px; max-width: 640px; margin-inline: auto;
+    font: 16px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: #f5f6f8; color: #1c1e21;
+  }
+  @media (prefers-color-scheme: dark) {
+    body { background: #16181c; color: #e8eaed; }
+    .card { background: #1f2228 !important; }
+    input { background: #16181c; color: #e8eaed; border-color: #3a3f47 !important; }
+    .file { border-color: #3a3f47 !important; }
+  }
+  h1 { font-size: 22px; margin: 8px 0 16px; }
+  .card { background: #fff; border-radius: 12px; padding: 16px; margin-bottom: 16px;
+          box-shadow: 0 1px 3px rgba(0,0,0,.12); }
+  label { display: block; font-size: 13px; opacity: .75; margin: 10px 0 4px; }
+  input { width: 100%; padding: 10px 12px; font-size: 16px; border: 1px solid #ccd0d5;
+          border-radius: 8px; }
+  button {
+    width: 100%; padding: 12px; margin-top: 14px; font-size: 16px; font-weight: 600;
+    color: #fff; background: #0866ff; border: 0; border-radius: 8px; cursor: pointer;
+  }
+  button:disabled { opacity: .45; cursor: default; }
+  button.secondary { background: transparent; color: #0866ff; margin-top: 6px; }
+  .error { color: #e5484d; font-size: 14px; margin-top: 10px; white-space: pre-wrap; }
+  .who { display: flex; justify-content: space-between; align-items: center; }
+  .who span { font-weight: 600; }
+  .who button { width: auto; margin: 0; padding: 8px 14px; }
+  .file { border: 1px solid #e4e6eb; border-radius: 8px; padding: 10px 12px; margin-top: 10px;
+          font-size: 14px; }
+  .file .head { display: flex; justify-content: space-between; gap: 8px; align-items: center; }
+  .file .name { font-weight: 600; overflow-wrap: anywhere; }
+  .file .cancel { width: auto; margin: 0; padding: 2px 12px; font-size: 13px; font-weight: 600;
+                  background: transparent; color: #e5484d; border: 1px solid currentColor;
+                  border-radius: 6px; flex-shrink: 0; }
+  .file .state { opacity: .8; margin-top: 2px; display: flex; justify-content: space-between;
+                 gap: 8px; flex-wrap: wrap; }
+  .file .pct { font-variant-numeric: tabular-nums; font-weight: 600; }
+  .bar { height: 6px; background: rgba(127,127,127,.25); border-radius: 3px; margin-top: 8px;
+         overflow: hidden; }
+  .bar > div { height: 100%; width: 0; background: #0866ff; transition: width .2s; }
+  .done .bar > div { background: #2f9e44; }
+  .failed .bar > div { background: #e5484d; }
+  .hint { font-size: 13px; opacity: .65; margin-top: 10px; }
+</style>
+</head>
+<body>
+<h1>&#128247; NAS Photo Upload</h1>
+
+<div class="card" id="loginCard" hidden>
+  <div>Sign in with your NAS (Synology) account.</div>
+  <label for="account">Username</label>
+  <input id="account" autocomplete="username" autocapitalize="none">
+  <label for="passwd">Password</label>
+  <input id="passwd" type="password" autocomplete="current-password">
+  <label for="otp">OTP code (only if you use 2-step verification)</label>
+  <input id="otp" inputmode="numeric" autocomplete="one-time-code">
+  <button id="loginBtn">Sign in</button>
+  <div class="error" id="loginError"></div>
+</div>
+
+<div class="card" id="uploadCard" hidden>
+  <div class="who">Signed in as <span id="whoName"></span>
+    <button class="secondary" id="logoutBtn">Sign out</button></div>
+  <input id="picker" type="file" multiple accept="image/*,video/*" style="margin-top:14px">
+  <button id="uploadBtn" disabled>Upload</button>
+  <div class="hint">Files upload smallest-first in ~50MB pieces, so big videos work
+    from anywhere. You can keep adding files while an upload is running. If the
+    connection drops, add the same files again &mdash; it resumes where it stopped.</div>
+  <div id="files"></div>
+</div>
+
+<script>
+"use strict";
+var CHUNK_RETRIES = 3;
+var CHUNK_MB = 50; // display-only estimate; the relay's /api/init value is authoritative
+// extensions Synology Photos rejects at upload (DSM error 620)
+var UNSUPPORTED = { mkv: 1, webm: 1, ts: 1, vob: 1, rm: 1, jfif: 1, avif: 1 };
+var session = null;
+try { session = JSON.parse(localStorage.getItem("relay_session") || "null"); } catch (e) {}
+
+var $ = function (id) { return document.getElementById(id); };
+
+function fmtSize(bytes) {
+  if (bytes >= 1073741824) return (bytes / 1073741824).toFixed(2) + " GB";
+  if (bytes >= 1048576) return (bytes / 1048576).toFixed(1) + " MB";
+  return Math.max(1, Math.round(bytes / 1024)) + " KB";
+}
+
+function show(loggedIn) {
+  $("loginCard").hidden = loggedIn;
+  $("uploadCard").hidden = !loggedIn;
+  if (loggedIn) $("whoName").textContent = session.user;
+}
+
+function saveSession() {
+  try { localStorage.setItem("relay_session", JSON.stringify(session)); } catch (e) {}
+}
+
+function clearSession() {
+  session = null;
+  try { localStorage.removeItem("relay_session"); } catch (e) {}
+  show(false);
+}
+
+function api(path, body) {
+  return fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  }).then(function (r) {
+    return r.json().then(function (j) { return { status: r.status, body: j }; });
+  });
+}
+
+// ---- login ----------------------------------------------------------------
+
+$("loginBtn").onclick = function () {
+  var account = $("account").value.trim();
+  $("loginError").textContent = "";
+  $("loginBtn").disabled = true;
+  api("/api/login", {
+    account: account,
+    passwd: $("passwd").value,
+    otp_code: $("otp").value.trim() || undefined
+  }).then(function (r) {
+    $("loginBtn").disabled = false;
+    if (r.status !== 200) {
+      var code = r.body && r.body.dsm_code;
+      $("loginError").textContent = code === 403 || code === 404
+        ? "OTP code required or wrong." : "Login failed. Check username and password.";
+      return;
+    }
+    session = { sid: r.body.sid, synotoken: r.body.synotoken, user: account };
+    $("passwd").value = ""; $("otp").value = "";
+    saveSession(); show(true);
+  }).catch(function () {
+    $("loginBtn").disabled = false;
+    $("loginError").textContent = "Cannot reach the relay. Try again.";
+  });
+};
+
+$("logoutBtn").onclick = clearSession;
+
+if (session && session.sid) {
+  fetch("/api/whoami", { headers: sidHeaders() }).then(function (r) {
+    if (r.status === 200) {
+      r.json().then(function (j) { session.user = j.user; show(true); });
+    } else if (r.status === 401) { clearSession(); }
+    else { show(true); } // relay/DSM hiccup: keep session, uploads will re-check
+  }).catch(function () { show(true); });
+} else {
+  show(false);
+}
+
+function sidHeaders() {
+  return { "X-Sid": session.sid, "X-Syno-Token": session.synotoken };
+}
+
+// ---- upload queue -----------------------------------------------------------
+// Picking files ADDS them to the queue (picker resets each time), so more files
+// can be added while an upload run is in progress; the pump picks them up.
+
+var queue = [];    // { file, ui, status: waiting|uploading|done|failed, key }
+var running = false;
+
+function row(file, pieces) {
+  var div = document.createElement("div");
+  div.className = "file";
+  div.innerHTML = '<div class="head"><div class="name"></div>' +
+                  '<button class="cancel" type="button">Cancel</button></div>' +
+                  '<div class="state"><span class="txt"></span><span class="pct"></span></div>' +
+                  '<div class="bar"><div></div></div>';
+  div.querySelector(".name").textContent = file.name;
+  $("files").appendChild(div);
+  var cancelBtn = div.querySelector(".cancel");
+  var ui = {
+    state: function (t) { div.querySelector(".txt").textContent = t; },
+    pct: function (t) { div.querySelector(".pct").textContent = t; },
+    progress: function (f) { div.querySelector(".bar > div").style.width = (f * 100).toFixed(1) + "%"; },
+    mark: function (cls) { div.className = "file " + cls; },
+    cancelBtn: cancelBtn,
+    hideCancel: function () { cancelBtn.hidden = true; }
+  };
+  ui.state("waiting · " + fmtSize(file.size) + " · " +
+           pieces + (pieces > 1 ? " pieces" : " piece"));
+  return ui;
+}
+
+function cancelItem(item) {
+  if (item.status !== "waiting" && item.status !== "uploading") return;
+  item.cancelled = true;
+  item.status = "cancelled";
+  item.ui.hideCancel();
+  item.ui.state("cancelled");
+  item.ui.pct("");
+  item.ui.mark("failed");
+  if (item.xhr) { try { item.xhr.abort(); } catch (e) {} }
+  if (item.uploadId) { // wipe staged chunks on the NAS
+    fetch("/api/upload?id=" + item.uploadId, { method: "DELETE", headers: sidHeaders() })
+      .then(function (r) {
+        if (r.status === 200) item.ui.state("cancelled · removed from NAS");
+      }).catch(function () {});
+  }
+  updateBtn();
+}
+
+$("picker").onchange = function () {
+  var files = Array.prototype.slice.call($("picker").files);
+  $("picker").value = ""; // reset so the same file can be picked again later
+  files.forEach(function (file) {
+    var key = file.name + "|" + file.size + "|" + file.lastModified;
+    var active = queue.some(function (q) {
+      return q.key === key && (q.status === "waiting" || q.status === "uploading");
+    });
+    if (active) return; // already queued
+    var pieces = Math.max(1, Math.ceil(file.size / (CHUNK_MB * 1048576)));
+    var ui = row(file, pieces);
+    var ext = (file.name.split(".").pop() || "").toLowerCase();
+    if (UNSUPPORTED[ext]) {
+      ui.state("Synology Photos does not support ." + ext + " files (convert to mp4 first)");
+      ui.mark("failed");
+      ui.hideCancel();
+      return;
+    }
+    var item = { file: file, ui: ui, status: "waiting", key: key,
+                 cancelled: false, xhr: null, uploadId: null };
+    ui.cancelBtn.onclick = function () { cancelItem(item); };
+    queue.push(item);
+  });
+  updateBtn();
+  if (running) pump(); // no-op if already pumping; new items are seen by the loop
+};
+
+function updateBtn() {
+  var waiting = queue.some(function (q) { return q.status === "waiting"; });
+  $("uploadBtn").disabled = running || !waiting;
+  $("uploadBtn").textContent = running ? "Uploading…" : "Upload";
+}
+
+$("uploadBtn").onclick = pump;
+
+function pump() {
+  if (running) return;
+  running = true;
+  updateBtn();
+  (function next() {
+    var waiting = queue.filter(function (q) { return q.status === "waiting"; });
+    if (!waiting.length) {
+      running = false;
+      updateBtn();
+      return;
+    }
+    waiting.sort(function (a, b) { return a.file.size - b.file.size; }); // smallest first
+    var item = waiting[0];
+    item.status = "uploading";
+    uploadFile(item).then(function () {
+      if (item.status !== "cancelled") {
+        item.status = "done";
+        item.ui.hideCancel();
+      }
+    }).catch(function (err) {
+      if (item.status === "cancelled") return; // cancel UI already applied
+      item.status = "failed";
+      item.ui.hideCancel();
+      item.ui.state("failed: " + (err && err.message ? err.message : err));
+      item.ui.mark("failed"); // keep going with the rest
+    }).then(next);
+  })();
+}
+
+function putChunk(item, uploadId, n, blob, onProgress) {
+  return new Promise(function (resolve, reject) {
+    var xhr = new XMLHttpRequest();
+    item.xhr = xhr;
+    xhr.open("PUT", "/api/chunk?id=" + uploadId + "&n=" + n);
+    xhr.setRequestHeader("X-Sid", session.sid);
+    xhr.setRequestHeader("X-Syno-Token", session.synotoken);
+    xhr.upload.onprogress = function (e) {
+      if (e.lengthComputable && onProgress) onProgress(e.loaded);
+    };
+    xhr.onload = function () {
+      item.xhr = null;
+      if (xhr.status === 200) resolve();
+      else reject(new Error("chunk " + n + ": HTTP " + xhr.status + " " + xhr.responseText));
+    };
+    xhr.onerror = function () { item.xhr = null; reject(new Error("chunk " + n + ": network error")); };
+    xhr.onabort = function () { item.xhr = null; reject(new Error("cancelled")); };
+    xhr.send(blob);
+  });
+}
+
+function uploadFile(item) {
+  var file = item.file, ui = item.ui;
+  ui.state("starting…");
+  return api("/api/init", {
+    sid: session.sid, synotoken: session.synotoken,
+    filename: file.name, size: file.size,
+    mtime: Math.round(file.lastModified / 1000)
+  }).then(function (r) {
+    if (r.status === 401) { clearSession(); throw new Error("Session expired - sign in again."); }
+    if (r.status !== 200) throw new Error(r.body.error || ("init failed: HTTP " + r.status));
+    if (item.cancelled) throw new Error("cancelled");
+    var uploadId = r.body.upload_id;
+    item.uploadId = uploadId;
+    var chunkSize = r.body.chunk_size;
+    var total = Math.max(1, Math.ceil(file.size / chunkSize));
+    var have = {};
+    var doneBytes = 0;
+    (r.body.received || []).forEach(function (n) {
+      have[n] = true;
+      doneBytes += (n === total - 1) ? file.size - (total - 1) * chunkSize : chunkSize;
+    });
+
+    function report(piece, extraSent) {
+      var sent = Math.min(file.size, doneBytes + (extraSent || 0));
+      ui.progress(sent / file.size);
+      ui.state("piece " + piece + " of " + total + " · " +
+               fmtSize(sent) + " of " + fmtSize(file.size));
+      ui.pct(Math.floor(sent / file.size * 100) + "%");
+    }
+
+    var chain = Promise.resolve();
+    var send = function (n) {
+      chain = chain.then(function () {
+        if (item.cancelled) throw new Error("cancelled");
+        if (have[n]) return;
+        var blob = file.slice(n * chunkSize, Math.min(file.size, (n + 1) * chunkSize));
+        report(n + 1, 0);
+        var attempt = function (left) {
+          return putChunk(item, uploadId, n, blob, function (sent) {
+            report(n + 1, sent);
+          }).catch(function (err) {
+            if (item.cancelled || left <= 0) throw err;
+            ui.state("retrying piece " + (n + 1) + "…");
+            return new Promise(function (res) { setTimeout(res, 3000); })
+              .then(function () { return attempt(left - 1); });
+          });
+        };
+        return attempt(CHUNK_RETRIES).then(function () { doneBytes += blob.size; });
+      });
+    };
+    for (var n = 0; n < total; n++) send(n);
+
+    return chain.then(function () {
+      if (item.cancelled) throw new Error("cancelled");
+      ui.progress(1);
+      ui.pct("100%");
+      ui.state("finishing on the NAS…");
+      return api("/api/complete", {
+        sid: session.sid, synotoken: session.synotoken, upload_id: uploadId
+      });
+    }).then(function (r2) {
+      if (r2.status === 401) { clearSession(); throw new Error("Session expired - sign in again."); }
+      if (r2.status !== 200) throw new Error(r2.body.error || ("complete failed: HTTP " + r2.status));
+      ui.state((r2.body.action === "ignore"
+        ? "already in Photos (skipped)" : "done - in your Photos timeline") +
+        " · " + fmtSize(file.size));
+      ui.pct("");
+      ui.mark("done");
+    });
+  });
+}
+</script>
+</body>
+</html>
