@@ -47,6 +47,15 @@ GB = 1024 * MB
 RELOGIN_CODES = {105, 106, 107, 119}
 UPLOAD_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
+# Destination libraries. Identical multipart format, different API name; DSM
+# enforces write permission against the lent session, so the relay does not
+# police who may write to the shared space.
+UPLOAD_APIS = {
+    "personal": "SYNO.Foto.Upload.Item",
+    "shared": "SYNO.FotoTeam.Upload.Item",
+}
+DEFAULT_SPACE = "personal"
+
 
 def log(msg):
     print("%s %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg), flush=True)
@@ -124,14 +133,15 @@ def dsm_whoami(sid, synotoken):
     return None, reply.get("error", {}).get("code", -1)
 
 
-def dsm_upload_item(name, mtime, chunk_paths, total_size, sid, synotoken):
+def dsm_upload_item(name, mtime, chunk_paths, total_size, sid, synotoken,
+                    space=DEFAULT_SPACE):
     """Stream the assembled file (straight from chunk files, no extra copy)
-    to SYNO.Foto.Upload.Item as the session's user. Verified format: see
-    docs/DSM_API_NOTES.md 'Upload API — VERIFIED'."""
+    to the personal or shared Photos library as the session's user. Verified
+    format: see docs/DSM_API_NOTES.md 'Upload API — VERIFIED'."""
     boundary = "----relay" + uuid.uuid4().hex
     ctype = mimetypes.guess_type(name)[0] or "application/octet-stream"
     fields = [
-        ("api", "SYNO.Foto.Upload.Item"),
+        ("api", UPLOAD_APIS[space]),
         ("method", "upload"),
         ("version", "1"),
         ("name", json.dumps(name)),
@@ -333,9 +343,11 @@ def staging_usage():
     return per_user, total
 
 
-def find_resumable(user, filename, size, sha256, mtime):
+def find_resumable(user, filename, size, sha256, mtime, space):
     for meta in iter_metas():
         if meta["user"] != user or meta["filename"] != filename or meta["size"] != size:
+            continue
+        if meta.get("space", DEFAULT_SPACE) != space:
             continue
         if sha256 and meta.get("sha256"):
             if meta["sha256"] == sha256:
@@ -555,20 +567,26 @@ class Handler(BaseHTTPRequestHandler):
         if sha256 and not re.match(r"^[0-9a-f]{64}$", sha256):
             self.send_json(400, {"error": "sha256 must be 64 hex chars"})
             return
+        space = body.get("space") or DEFAULT_SPACE
+        if space not in UPLOAD_APIS:
+            self.send_json(400, {"error": "space must be one of: %s"
+                                 % ", ".join(sorted(UPLOAD_APIS))})
+            return
         user = self.session_from_body(body)
         if user is None:
             return
 
         with _staging_lock:
-            existing = find_resumable(user, filename, size, sha256, mtime)
+            existing = find_resumable(user, filename, size, sha256, mtime, space)
             if existing:
                 self.send_json(200, {
                     "upload_id": existing["upload_id"],
                     "chunk_size": existing["chunk_size"],
                     "received": received_chunks(existing["upload_id"]),
+                    "space": space,
                 })
-                log("init resume %s: %s %s (%d bytes)"
-                    % (existing["upload_id"], user, filename, size))
+                log("init resume %s: %s %s -> %s (%d bytes)"
+                    % (existing["upload_id"], user, filename, space, size))
                 return
             per_user, total = staging_usage()
             if per_user.get(user, 0) + size > CFG["USER_QUOTA"]:
@@ -585,16 +603,18 @@ class Handler(BaseHTTPRequestHandler):
                 "size": size,
                 "mtime": mtime,
                 "sha256": sha256,
+                "space": space,
                 "chunk_size": CFG["CHUNK_MAX"],
                 "created": int(time.time()),
             }
             os.makedirs(upload_dir(meta["upload_id"]), exist_ok=True)
             save_meta(meta)
-        log("init new %s: %s %s (%d bytes, %d chunks)"
-            % (meta["upload_id"], user, filename, size,
+        log("init new %s: %s %s -> %s (%d bytes, %d chunks)"
+            % (meta["upload_id"], user, filename, space, size,
                num_chunks(size, meta["chunk_size"])))
         self.send_json(200, {"upload_id": meta["upload_id"],
-                             "chunk_size": meta["chunk_size"], "received": []})
+                             "chunk_size": meta["chunk_size"], "received": [],
+                             "space": space})
 
     def handle_chunk(self, url):
         query = parse_qs(url.query)
@@ -755,7 +775,8 @@ class Handler(BaseHTTPRequestHandler):
                 return
         try:
             reply = dsm_upload_item(meta["filename"], meta["mtime"], paths,
-                                    meta["size"], body["sid"], body["synotoken"])
+                                    meta["size"], body["sid"], body["synotoken"],
+                                    meta.get("space", DEFAULT_SPACE))
         except OSError as exc:
             log("complete %s: DSM upload I/O error: %s" % (meta["upload_id"], exc))
             self.send_json(502, {"error": "Photos upload failed, retry /complete"})
@@ -769,9 +790,9 @@ class Handler(BaseHTTPRequestHandler):
             save_tombstone(meta["upload_id"],
                            {"user": user, "result": result, "ts": int(time.time())})
             shutil.rmtree(upload_dir(meta["upload_id"]), ignore_errors=True)
-            log("complete %s: %s %s -> action=%s id=%s"
+            log("complete %s: %s %s -> %s action=%s id=%s"
                 % (meta["upload_id"], user, meta["filename"],
-                   result["action"], result["id"]))
+                   meta.get("space", DEFAULT_SPACE), result["action"], result["id"]))
             self.send_json(200, result)
             return
         code = reply.get("error", {}).get("code", -1)
