@@ -38,6 +38,18 @@ DEFAULTS = {
     "SID_CACHE_SECONDS": "300",
     "INIT_RATE_LIMIT": "30",       # per INIT_RATE_WINDOW per client IP
     "INIT_RATE_WINDOW": "600",
+    # -- SideStore/AltStore source (all optional; source is disabled until
+    #    SOURCE_PUBLIC_URL and APP_BUNDLE_ID are set in relay.config) --------
+    "IPA_DIR": "./ipa",            # drop <APP_NAME>-<version>.ipa (+ icon.png) here
+    "SOURCE_PUBLIC_URL": "",       # e.g. https://upload.example.com (no trailing /)
+    "SOURCE_NAME": "Family Apps",
+    "SOURCE_IDENTIFIER": "",       # reverse-DNS id, e.g. com.example.family-source
+    "APP_NAME": "PhotoRelay",
+    "APP_BUNDLE_ID": "",           # e.g. com.example.photorelay
+    "APP_DEVELOPER": "Self-hosted",
+    "APP_DESCRIPTION": "Photo and video backup to the family NAS.",
+    "APP_MIN_OS": "16.0",
+    "APP_TINT": "",                # hex without '#', e.g. 0C1346
 }
 
 CFG = {}
@@ -76,6 +88,11 @@ def load_config(path):
     if not os.path.isabs(staging):
         staging = os.path.join(os.path.dirname(os.path.abspath(path)), staging)
     cfg["STAGING"] = staging
+    ipa_dir = cfg["IPA_DIR"]
+    if not os.path.isabs(ipa_dir):
+        ipa_dir = os.path.join(os.path.dirname(os.path.abspath(path)), ipa_dir)
+    cfg["IPA_PATH"] = ipa_dir
+    cfg["SOURCE_PUBLIC_URL"] = cfg["SOURCE_PUBLIC_URL"].rstrip("/")
     dsm = urlsplit(cfg["DSM_URL"])
     cfg["DSM_HOST"] = dsm.hostname
     cfg["DSM_PORT"] = dsm.port or (443 if dsm.scheme == "https" else 80)
@@ -449,6 +466,10 @@ class Handler(BaseHTTPRequestHandler):
             self.handle_whoami()
         elif url.path in ("/", "/index.html"):
             self.serve_index()
+        elif url.path == "/sidestore/source.json":
+            self.serve_source_json()
+        elif url.path.startswith("/ipa/"):
+            self.serve_ipa(url.path[len("/ipa/"):])
         else:
             self.send_json(404, {"error": "not found"})
 
@@ -489,6 +510,84 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    # -- SideStore/AltStore source ----------------------------------------
+    # Public by design: the IPA and source.json are just app binaries/metadata
+    # (useless without DSM credentials). SideStore re-signs the IPA with each
+    # installer's own Apple ID, so what is served here needs no signing state.
+
+    IPA_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+\.(ipa|png)$")
+
+    def serve_ipa(self, name):
+        if not self.IPA_NAME_RE.match(name) or name != os.path.basename(name):
+            self.send_json(404, {"error": "not found"})
+            return
+        path = os.path.join(CFG["IPA_PATH"], name)
+        try:
+            size = os.path.getsize(path)
+            fh = open(path, "rb")
+        except OSError:
+            self.send_json(404, {"error": "not found"})
+            return
+        with fh:
+            ctype = "image/png" if name.endswith(".png") else "application/octet-stream"
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(size))
+            self.end_headers()
+            shutil.copyfileobj(fh, self.wfile, length=MB)
+
+    def serve_source_json(self):
+        if not CFG["SOURCE_PUBLIC_URL"] or not CFG["APP_BUNDLE_ID"]:
+            self.send_json(404, {"error": "source not configured"})
+            return
+        base = CFG["SOURCE_PUBLIC_URL"]
+        prefix = CFG["APP_NAME"] + "-"
+        versions = []
+        try:
+            entries = os.listdir(CFG["IPA_PATH"])
+        except OSError:
+            entries = []
+        for entry in entries:
+            if not (entry.startswith(prefix) and entry.endswith(".ipa")):
+                continue
+            path = os.path.join(CFG["IPA_PATH"], entry)
+            try:
+                stat = os.stat(path)
+            except OSError:
+                continue
+            versions.append({
+                "version": entry[len(prefix):-len(".ipa")],
+                "date": time.strftime("%Y-%m-%d", time.localtime(stat.st_mtime)),
+                "size": stat.st_size,
+                "downloadURL": "%s/ipa/%s" % (base, entry),
+                "minOSVersion": CFG["APP_MIN_OS"],
+                "_mtime": stat.st_mtime,
+            })
+        versions.sort(key=lambda v: v.pop("_mtime"), reverse=True)
+        app = {
+            "name": CFG["APP_NAME"],
+            "bundleIdentifier": CFG["APP_BUNDLE_ID"],
+            "developerName": CFG["APP_DEVELOPER"],
+            "localizedDescription": CFG["APP_DESCRIPTION"],
+            "versions": versions,
+        }
+        if CFG["APP_TINT"]:
+            app["tintColor"] = "#" + CFG["APP_TINT"]
+        if os.path.exists(os.path.join(CFG["IPA_PATH"], "icon.png")):
+            app["iconURL"] = base + "/ipa/icon.png"
+        source = {
+            "name": CFG["SOURCE_NAME"],
+            "identifier": CFG["SOURCE_IDENTIFIER"] or CFG["APP_BUNDLE_ID"] + ".source",
+            "apps": [app],
+        }
+        body = json.dumps(source, indent=2).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-cache")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
