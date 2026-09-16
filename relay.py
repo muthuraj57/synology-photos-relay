@@ -667,7 +667,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(400, {"error": "sha256 must be 64 hex chars"})
             return
         space = body.get("space") or DEFAULT_SPACE
-        if space not in UPLOAD_APIS:
+        if not isinstance(space, str) or space not in UPLOAD_APIS:
             self.send_json(400, {"error": "space must be one of: %s"
                                  % ", ".join(sorted(UPLOAD_APIS))})
             return
@@ -895,6 +895,14 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, result)
             return
         code = reply.get("error", {}).get("code", -1)
+        if code == 801:  # no Shared Space access for this user (verified live)
+            # not transient: keep staging so the user can re-point at personal
+            # space, but tell the client plainly instead of the generic 502
+            log("complete %s: no Shared Space access for %s (staging kept)"
+                % (meta["upload_id"], user))
+            self.send_json(403, {"error": "No access to Shared Space",
+                                 "dsm_code": 801})
+            return
         if code == 620:  # unsupported file extension (verified: same bytes ok as .mp4)
             shutil.rmtree(upload_dir(meta["upload_id"]), ignore_errors=True)
             log("complete %s: unsupported type %s, staging dropped"

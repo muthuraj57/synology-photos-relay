@@ -110,4 +110,5 @@ GET    /              → web uploader
   answer to the lent session, never from the client.
 - `space: "shared"` uploads via `SYNO.FotoTeam.Upload.Item` instead of
   `SYNO.Foto.Upload.Item`. A user who lacks write access to the shared space
-  gets DSM's own error, exactly as in the official app.
+  gets DSM error 801, which `/complete` reports as HTTP 403
+  `{"error": "No access to Shared Space", "dsm_code": 801}` (staging kept).
