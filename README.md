@@ -15,16 +15,18 @@ uploader page** — no app install needed.
 - Chunked, **resumable** uploads: interrupted transfers continue from the last
   received chunk (works across relay restarts; retrying a completed upload
   returns the recorded result instead of re-uploading).
-- Uploads land in the correct user's personal space with correct ownership,
-  timeline date (`mtime`), indexing, and dedup — because the final upload is
-  made with that user's own DSM session.
+- Uploads land in the correct user's **personal or shared space** with correct
+  ownership, timeline date (`mtime`), indexing, and dedup — because the final
+  upload is made with that user's own DSM session. DSM enforces write
+  permission on the shared space, so the relay does not have to.
 - **No credentials stored, ever.** Clients log into DSM themselves and lend
   their session (`sid` + `synotoken`); the relay validates it against DSM
   before accepting a single byte. Knowing the relay URL is worthless without
   a valid DSM login.
-- Web uploader at `/`: DSM login (incl. optional OTP), multi-file queue you
-  can keep adding to mid-upload, smallest-first ordering, per-file progress
-  (size + percent), cancel (deletes staged chunks), resume.
+- Web uploader at `/`: DSM login (incl. optional OTP), destination picker
+  (personal or shared), multi-file queue you can keep adding to mid-upload,
+  smallest-first ordering, per-file progress (size + percent), cancel (deletes
+  staged chunks), resume.
 - Zero dependencies: Python 3.8+ standard library only. One file.
 - Housekeeping: per-user and global staging quotas, stale-upload eviction
   (default 10 days idle), per-IP rate limiting on upload creation.
@@ -83,8 +85,10 @@ proxy to DSM that stores nothing).
 ```
 POST   /api/login     {account, passwd, otp_code?} → {sid, synotoken}
 GET    /api/whoami    headers X-Sid, X-Syno-Token → {user}
-POST   /api/init      {sid, synotoken, filename, size, mtime, sha256?}
-                      → {upload_id, chunk_size, received:[...]}   (resume-aware)
+POST   /api/init      {sid, synotoken, filename, size, mtime, sha256?,
+                       space?}   space: "personal" (default) | "shared"
+                      → {upload_id, chunk_size, received:[...], space}
+                      (resume-aware; a resume only matches the same space)
 PUT    /api/chunk?id=<upload_id>&n=<index>   raw bytes, headers X-Sid, X-Syno-Token
 GET    /api/status?id=<upload_id>            → {received, size, state}
 POST   /api/complete  {sid, synotoken, upload_id, sha256?}
@@ -104,3 +108,6 @@ GET    /              → web uploader
   rename.
 - The relay trusts DSM for identity: the username always comes from DSM's
   answer to the lent session, never from the client.
+- `space: "shared"` uploads via `SYNO.FotoTeam.Upload.Item` instead of
+  `SYNO.Foto.Upload.Item`. A user who lacks write access to the shared space
+  gets DSM's own error, exactly as in the official app.

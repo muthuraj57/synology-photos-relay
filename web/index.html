@@ -22,8 +22,8 @@
   .card { background: #fff; border-radius: 12px; padding: 16px; margin-bottom: 16px;
           box-shadow: 0 1px 3px rgba(0,0,0,.12); }
   label { display: block; font-size: 13px; opacity: .75; margin: 10px 0 4px; }
-  input { width: 100%; padding: 10px 12px; font-size: 16px; border: 1px solid #ccd0d5;
-          border-radius: 8px; }
+  input, select { width: 100%; padding: 10px 12px; font-size: 16px;
+          border: 1px solid #ccd0d5; border-radius: 8px; background: #fff; }
   button {
     width: 100%; padding: 12px; margin-top: 14px; font-size: 16px; font-weight: 600;
     color: #fff; background: #0866ff; border: 0; border-radius: 8px; cursor: pointer;
@@ -70,11 +70,18 @@
 <div class="card" id="uploadCard" hidden>
   <div class="who">Signed in as <span id="whoName"></span>
     <button class="secondary" id="logoutBtn">Sign out</button></div>
+  <label for="space">Upload to</label>
+  <select id="space">
+    <option value="personal">My personal space</option>
+    <option value="shared">Shared space</option>
+  </select>
   <input id="picker" type="file" multiple accept="image/*,video/*" style="margin-top:14px">
   <button id="uploadBtn" disabled>Upload</button>
   <div class="hint">Files upload smallest-first in ~50MB pieces, so big videos work
     from anywhere. You can keep adding files while an upload is running. If the
-    connection drops, add the same files again &mdash; it resumes where it stopped.</div>
+    connection drops, add the same files again &mdash; it resumes where it stopped.
+    Each file goes to the destination selected when you picked it, so you can
+    change &ldquo;Upload to&rdquo; and add more files to the same queue.</div>
   <div id="files"></div>
 </div>
 
@@ -172,7 +179,7 @@ function sidHeaders() {
 var queue = [];    // { file, ui, status: waiting|uploading|done|failed, key }
 var running = false;
 
-function row(file, pieces) {
+function row(file, pieces, space) {
   var div = document.createElement("div");
   div.className = "file";
   div.innerHTML = '<div class="head"><div class="name"></div>' +
@@ -191,7 +198,8 @@ function row(file, pieces) {
     hideCancel: function () { cancelBtn.hidden = true; }
   };
   ui.state("waiting · " + fmtSize(file.size) + " · " +
-           pieces + (pieces > 1 ? " pieces" : " piece"));
+           pieces + (pieces > 1 ? " pieces" : " piece") + " · " +
+           (space === "shared" ? "shared" : "personal"));
   return ui;
 }
 
@@ -216,14 +224,15 @@ function cancelItem(item) {
 $("picker").onchange = function () {
   var files = Array.prototype.slice.call($("picker").files);
   $("picker").value = ""; // reset so the same file can be picked again later
+  var space = $("space").value;
   files.forEach(function (file) {
-    var key = file.name + "|" + file.size + "|" + file.lastModified;
+    var key = file.name + "|" + file.size + "|" + file.lastModified + "|" + space;
     var active = queue.some(function (q) {
       return q.key === key && (q.status === "waiting" || q.status === "uploading");
     });
     if (active) return; // already queued
     var pieces = Math.max(1, Math.ceil(file.size / (CHUNK_MB * 1048576)));
-    var ui = row(file, pieces);
+    var ui = row(file, pieces, space);
     var ext = (file.name.split(".").pop() || "").toLowerCase();
     if (UNSUPPORTED[ext]) {
       ui.state("Synology Photos does not support ." + ext + " files (convert to mp4 first)");
@@ -231,7 +240,7 @@ $("picker").onchange = function () {
       ui.hideCancel();
       return;
     }
-    var item = { file: file, ui: ui, status: "waiting", key: key,
+    var item = { file: file, ui: ui, status: "waiting", key: key, space: space,
                  cancelled: false, xhr: null, uploadId: null };
     ui.cancelBtn.onclick = function () { cancelItem(item); };
     queue.push(item);
@@ -304,7 +313,8 @@ function uploadFile(item) {
   return api("/api/init", {
     sid: session.sid, synotoken: session.synotoken,
     filename: file.name, size: file.size,
-    mtime: Math.round(file.lastModified / 1000)
+    mtime: Math.round(file.lastModified / 1000),
+    space: item.space
   }).then(function (r) {
     if (r.status === 401) { clearSession(); throw new Error("Session expired - sign in again."); }
     if (r.status !== 200) throw new Error(r.body.error || ("init failed: HTTP " + r.status));
